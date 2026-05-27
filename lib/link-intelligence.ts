@@ -1,7 +1,3 @@
-import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { db } from './db';
 import { wxSessions } from './wx';
 import { cache } from './cache';
@@ -12,7 +8,9 @@ const MAX_TITLE_FETCHES = 8;
 const TITLE_FETCH_TIMEOUT_MS = 1400;
 const MAX_TITLE_GENERATION_ITEMS = 80;
 const CODEX_TIMEOUT_MS = Number(process.env.WECHAT_RADAR_LINK_CODEX_TIMEOUT_MS ?? 180_000);
-const CODEX_MODEL = process.env.WECHAT_RADAR_CODEX_MODEL;
+const LLM_MODEL = process.env.WECHAT_RADAR_CODEX_MODEL || 'gpt-5.4';
+const LLM_API_BASE = process.env.WECHAT_RADAR_LLM_API_BASE || 'https://www.micuapi.ai/v1';
+const LLM_API_KEY = process.env.OPENAI_API_KEY || '';
 const LINK_INTELLIGENCE_CACHE_VERSION = 'v8';
 const LINK_INTELLIGENCE_CACHE_TTL_SECONDS = 60 * 60 * 24;
 
@@ -295,62 +293,37 @@ function parseJsonOutput<T>(raw: string): T {
   }
 }
 
-function runCodexJson<T>(prompt: string, schema: unknown, timeoutMs = CODEX_TIMEOUT_MS): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const dir = mkdtempSync(join(tmpdir(), 'wechat-links-'));
-    const schemaPath = join(dir, 'schema.json');
-    const outPath = join(dir, 'response.json');
-    writeFileSync(schemaPath, JSON.stringify(schema), 'utf8');
+async function runLlmJson<T>(prompt: string, _schema: unknown, timeoutMs = CODEX_TIMEOUT_MS): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-    const args = [
-      '-a',
-      'never',
-      'exec',
-      '--sandbox',
-      'read-only',
-      '--ephemeral',
-      '--ignore-rules',
-      '--output-schema',
-      schemaPath,
-      '--output-last-message',
-      outPath,
-    ];
-    if (CODEX_MODEL) args.push('--model', CODEX_MODEL);
-    args.push('-');
+  try {
+    const res = await fetch(`${LLM_API_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${LLM_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: LLM_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+        response_format: { type: 'json_object' },
+      }),
+      signal: controller.signal,
+    });
 
-    const proc = spawn('codex', args, {
-      env: { ...process.env, NO_COLOR: '1' },
-      stdio: ['pipe', 'ignore', 'pipe'],
-    });
-    let stderr = '';
-    const t = setTimeout(() => {
-      proc.kill('SIGTERM');
-      rmSync(dir, { recursive: true, force: true });
-      reject(new Error('codex CLI timeout'));
-    }, timeoutMs);
-    proc.stderr.on('data', (d) => (stderr += d.toString()));
-    proc.on('error', (e) => {
-      clearTimeout(t);
-      rmSync(dir, { recursive: true, force: true });
-      reject(e);
-    });
-    proc.on('close', (code) => {
-      clearTimeout(t);
-      try {
-        if (code !== 0) {
-          reject(new Error(`codex exit ${code}: ${stderr.slice(0, 800)}`));
-          return;
-        }
-        resolve(parseJsonOutput<T>(readFileSync(outPath, 'utf8')));
-      } catch (e) {
-        reject(e);
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
-    });
-    proc.stdin.write(prompt);
-    proc.stdin.end();
-  });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`LLM API ${res.status}: ${text.slice(0, 400)}`);
+    }
+
+    const json = (await res.json()) as { choices: Array<{ message: { content: string } }> };
+    const content = json.choices?.[0]?.message?.content ?? '';
+    return parseJsonOutput<T>(content);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function fallbackDedupeKey(item: LinkIntelligenceItem): string {
@@ -394,7 +367,7 @@ ${rows}`;
 async function generateTitlesAndKeys(items: LinkIntelligenceItem[]) {
   if (items.length === 0) return;
   try {
-    const response = await runCodexJson<GeneratedLinkTitleResponse>(
+    const response = await runLlmJson<GeneratedLinkTitleResponse>(
       buildTitleGenerationPrompt(items),
       LINK_TITLE_SCHEMA,
     );

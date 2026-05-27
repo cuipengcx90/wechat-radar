@@ -1,7 +1,3 @@
-import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { db } from './db';
 import { wxSessions } from './wx';
 
@@ -12,7 +8,9 @@ const MAX_MESSAGES_TO_PROCESS = 3000;
 const MAX_TOPICS_TO_SAVE = 30;
 const CODEX_CHUNK_SIZE = Number(process.env.WECHAT_RADAR_TOPIC_CHUNK_SIZE ?? 250);
 const CODEX_TIMEOUT_MS = Number(process.env.WECHAT_RADAR_CODEX_TIMEOUT_MS ?? 300_000);
-const CODEX_MODEL = process.env.WECHAT_RADAR_CODEX_MODEL;
+const LLM_MODEL = process.env.WECHAT_RADAR_CODEX_MODEL || 'gpt-5.4';
+const LLM_API_BASE = process.env.WECHAT_RADAR_LLM_API_BASE || 'https://www.micuapi.ai/v1';
+const LLM_API_KEY = process.env.OPENAI_API_KEY || '';
 const TOPICS_PER_CHUNK = 12;
 
 interface SourceMsg {
@@ -126,30 +124,6 @@ function loadCandidateMessages(date: string): SourceMsg[] {
   return Array.from(seen.values());
 }
 
-const TOPIC_RESPONSE_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  properties: {
-    topics: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          title: { type: 'string' },
-          summary: { type: 'string' },
-          message_ids: {
-            type: 'array',
-            items: { type: 'string' },
-          },
-        },
-        required: ['title', 'summary', 'message_ids'],
-      },
-    },
-  },
-  required: ['topics'],
-};
-
 function sourceId(m: SourceMsg): string {
   return `${m.chatroom_id}#${m.local_id}`;
 }
@@ -173,66 +147,37 @@ function parseJsonOutput<T>(raw: string): T {
   }
 }
 
-function runCodexJson<T>(prompt: string, timeoutMs = CODEX_TIMEOUT_MS): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const dir = mkdtempSync(join(tmpdir(), 'wechat-topics-'));
-    const schemaPath = join(dir, 'schema.json');
-    const outPath = join(dir, 'response.json');
-    writeFileSync(schemaPath, JSON.stringify(TOPIC_RESPONSE_SCHEMA), 'utf8');
+async function runLlmJson<T>(prompt: string, timeoutMs = CODEX_TIMEOUT_MS): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-    const args = [
-      '-a',
-      'never',
-      'exec',
-      '--sandbox',
-      'read-only',
-      '--ephemeral',
-      '--ignore-rules',
-      '--output-schema',
-      schemaPath,
-      '--output-last-message',
-      outPath,
-    ];
-    if (CODEX_MODEL) args.push('--model', CODEX_MODEL);
-    args.push('-');
+  try {
+    const res = await fetch(`${LLM_API_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${LLM_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: LLM_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+        response_format: { type: 'json_object' },
+      }),
+      signal: controller.signal,
+    });
 
-    const proc = spawn(
-      'codex',
-      args,
-      { env: { ...process.env, NO_COLOR: '1' }, stdio: ['pipe', 'pipe', 'pipe'] },
-    );
-    let stdout = '';
-    let stderr = '';
-    const t = setTimeout(() => {
-      proc.kill('SIGTERM');
-      rmSync(dir, { recursive: true, force: true });
-      reject(new Error('codex CLI timeout'));
-    }, timeoutMs);
-    proc.stdout.on('data', (d) => (stdout += d.toString()));
-    proc.stderr.on('data', (d) => (stderr += d.toString()));
-    proc.on('error', (e) => {
-      clearTimeout(t);
-      rmSync(dir, { recursive: true, force: true });
-      reject(e);
-    });
-    proc.on('close', (code) => {
-      clearTimeout(t);
-      try {
-        if (code !== 0) {
-          reject(new Error(`codex exit ${code}: ${stderr.slice(0, 800)}`));
-          return;
-        }
-        const raw = readFileSync(outPath, 'utf8') || stdout;
-        resolve(parseJsonOutput<T>(raw));
-      } catch (e) {
-        reject(e);
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
-      }
-    });
-    proc.stdin.write(prompt);
-    proc.stdin.end();
-  });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`LLM API ${res.status}: ${text.slice(0, 400)}`);
+    }
+
+    const json = (await res.json()) as { choices: Array<{ message: { content: string } }> };
+    const content = json.choices?.[0]?.message?.content ?? '';
+    return parseJsonOutput<T>(content);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function formatMessagesForPrompt(messages: SourceMsg[], groupNameMap: Map<string, string>): string {
@@ -361,7 +306,7 @@ async function aggregateWithCodex(
   });
 
   for (let i = 0; i < chunks.length; i++) {
-    const response = await runCodexJson<LlmTopicResponse>(
+    const response = await runLlmJson<LlmTopicResponse>(
       buildExtractionPrompt(date, chunks[i], groupNameMap, TOPICS_PER_CHUNK),
     );
     drafts.push(...(response.topics ?? []));
@@ -387,7 +332,7 @@ async function aggregateWithCodex(
   const final =
     chunks.length === 1
       ? { topics: drafts }
-      : await runCodexJson<LlmTopicResponse>(buildMergePrompt(date, drafts, MAX_TOPICS_TO_SAVE));
+      : await runLlmJson<LlmTopicResponse>(buildMergePrompt(date, drafts, MAX_TOPICS_TO_SAVE));
 
   return normalizeTopics(final.topics ?? [], messageMap);
 }
