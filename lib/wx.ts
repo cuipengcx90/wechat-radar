@@ -27,7 +27,8 @@ async function wxJson<T>(args: string[], opts = DEFAULT_OPTS): Promise<T> {
 }
 
 export async function wxSessions(limit = 500): Promise<WxSession[]> {
-  return wxJson<WxSession[]>(['sessions', '-n', String(limit)]);
+  const raw = await wxJson<{ sessions: WxSession[] } | WxSession[]>(['sessions', '-n', String(limit)]);
+  return Array.isArray(raw) ? raw : raw.sessions;
 }
 
 export async function wxStats(
@@ -44,7 +45,7 @@ export async function wxHistory(
   until: string,
   limit = 1000,
 ): Promise<WxMessage[]> {
-  return wxJson<WxMessage[]>([
+  const raw = await wxJson<{ messages: WxMessage[] } | WxMessage[]>([
     'history',
     chat,
     '--since',
@@ -54,10 +55,12 @@ export async function wxHistory(
     '-n',
     String(limit),
   ]);
+  return Array.isArray(raw) ? raw : raw.messages;
 }
 
 export async function wxNewMessages(limit = 50): Promise<WxNewMessage[]> {
-  return wxJson<WxNewMessage[]>(['new-messages', '-n', String(limit)]);
+  const raw = await wxJson<{ messages: WxNewMessage[] } | WxNewMessage[]>(['new-messages', '-n', String(limit)]);
+  return Array.isArray(raw) ? raw : raw.messages;
 }
 
 export async function wxMembers(chat: string): Promise<WxMember[]> {
